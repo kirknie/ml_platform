@@ -124,13 +124,15 @@ git push -u origin main
 
 ### What we're building
 
-`ingestion/fetch.py` downloads daily OHLCV data for a configurable list of tickers using `yfinance` and writes one Parquet file per ticker to `data/raw/`.
+`ingestion/fetch.py` downloads 3 years of daily OHLCV data for 5 tickers using `yfinance` and writes one Parquet file per ticker to `data/raw/`. `ingestion/stream.py` replays those files row-by-row to simulate a live data feed.
 
 ### Why Parquet?
 
 - Columnar format — fast for feature computation over many rows
 - Schema-preserving — no type ambiguity vs CSV
 - Append-friendly — you can write new files per date range and combine later
+
+**Note on partitioning:** The preview calls for Parquet files partitioned by ticker and date. For Week 5, we write one flat file per ticker (e.g. `AAPL.parquet`) — sufficient for ~750 rows. The offline feature store in Week 6 will introduce date-based partitioning when we need to support incremental backfills.
 
 ### 2.1 Create `ingestion/__init__.py` (empty)
 
@@ -155,7 +157,7 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 
 TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA", "NVDA"]
-DEFAULT_START = "2018-01-01"
+DEFAULT_START = "2021-01-01"
 DEFAULT_END = "2024-12-31"
 RAW_DATA_DIR = Path(__file__).parent.parent / "data" / "raw"
 
@@ -295,6 +297,203 @@ def validate_raw(df: pd.DataFrame, ticker: str) -> None:
         raise ValueError(f"[{ticker}] Date index is not sorted ascending")
 ```
 
+### 2.4 Create `ingestion/stream.py`
+
+```python
+"""
+Simulated streaming for historical OHLCV data.
+
+Replays a ticker's Parquet file in time order, emitting one row at a time
+with a configurable delay. Used to test the online serving path without a
+real data feed.
+
+Design decisions:
+- Generator-based: caller controls consumption rate; no internal threading
+- Configurable delay: set to 0 for tests, >0 to simulate real-time arrival
+- Yields plain dicts: easy to consume in the serving layer without a DataFrame dependency
+"""
+
+import time
+from collections.abc import Generator
+from pathlib import Path
+
+import pandas as pd
+
+from ingestion.fetch import RAW_DATA_DIR, load_ticker
+
+
+def stream_ticker(
+    ticker: str,
+    delay_seconds: float = 0.0,
+    data_dir: Path = RAW_DATA_DIR,
+) -> Generator[dict, None, None]:
+    """
+    Replay a ticker's historical data row by row in time order.
+
+    Args:
+        ticker: Ticker symbol, e.g. "AAPL"
+        delay_seconds: Pause between emitted rows. Set to 0 for tests.
+        data_dir: Directory containing Parquet files from fetch.py
+
+    Yields:
+        Dict with keys: date, open, high, low, close, volume, ticker
+
+    Raises:
+        FileNotFoundError: If the ticker has not been fetched yet
+    """
+    df = load_ticker(ticker, data_dir)
+
+    for date, row in df.iterrows():
+        yield {
+            "date": date,
+            "open": row["open"],
+            "high": row["high"],
+            "low": row["low"],
+            "close": row["close"],
+            "volume": row["volume"],
+            "ticker": row["ticker"],
+        }
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+
+def stream_ticker_window(
+    ticker: str,
+    window_size: int,
+    delay_seconds: float = 0.0,
+    data_dir: Path = RAW_DATA_DIR,
+) -> Generator[pd.DataFrame, None, None]:
+    """
+    Replay a ticker's historical data as a rolling window of rows.
+
+    At each step, yields the last `window_size` rows up to and including
+    the current row. This is the format expected by the online feature store:
+    features at time T require the preceding N rows of price history.
+
+    Args:
+        ticker: Ticker symbol
+        window_size: Number of rows in each emitted window (e.g. 20 for a 20-day rolling feature)
+        delay_seconds: Pause between emitted windows
+        data_dir: Directory containing Parquet files
+
+    Yields:
+        DataFrame of shape (window_size, columns), sorted by date ascending.
+        Rows where fewer than window_size rows are available are skipped.
+    """
+    df = load_ticker(ticker, data_dir)
+
+    for i in range(window_size, len(df) + 1):
+        yield df.iloc[i - window_size : i].copy()
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+```
+
+### 2.5 Create `tests/__init__.py` (empty) and `tests/test_ingestion.py`
+
+```python
+"""Tests for ingestion/fetch.py and ingestion/validate.py"""
+
+import pandas as pd
+import pytest
+
+from ingestion.validate import validate_raw
+
+
+def make_valid_df(n=200) -> pd.DataFrame:
+    dates = pd.date_range("2020-01-01", periods=n, freq="B")
+    return pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1_000_000,
+            "ticker": "AAPL",
+        },
+        index=dates,
+    )
+
+
+def test_validate_raw_passes_valid_data():
+    df = make_valid_df()
+    validate_raw(df, "AAPL")  # should not raise
+
+
+def test_validate_raw_fails_on_missing_column():
+    df = make_valid_df().drop(columns=["volume"])
+    with pytest.raises(ValueError, match="Missing columns"):
+        validate_raw(df, "AAPL")
+
+
+def test_validate_raw_fails_on_too_few_rows():
+    df = make_valid_df(n=50)
+    with pytest.raises(ValueError, match="Only 50 rows"):
+        validate_raw(df, "AAPL")
+
+
+def test_validate_raw_fails_on_null_values():
+    df = make_valid_df()
+    df.loc[df.index[5], "close"] = None
+    with pytest.raises(ValueError, match="Null values"):
+        validate_raw(df, "AAPL")
+
+
+def test_validate_raw_fails_on_non_positive_close():
+    df = make_valid_df()
+    df.loc[df.index[0], "close"] = -1.0
+    with pytest.raises(ValueError, match="Non-positive close"):
+        validate_raw(df, "AAPL")
+
+
+def test_stream_ticker_yields_all_rows(tmp_path):
+    """stream_ticker should yield one dict per row in the Parquet file."""
+    import pandas as pd
+    from ingestion.stream import stream_ticker
+
+    dates = pd.date_range("2021-01-01", periods=10, freq="B")
+    df = pd.DataFrame(
+        {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100, "ticker": "AAPL"},
+        index=dates,
+    )
+    df.index.name = "date"
+    df.to_parquet(tmp_path / "AAPL.parquet")
+
+    rows = list(stream_ticker("AAPL", delay_seconds=0, data_dir=tmp_path))
+    assert len(rows) == 10
+    assert set(rows[0].keys()) == {"date", "open", "high", "low", "close", "volume", "ticker"}
+    assert rows[0]["ticker"] == "AAPL"
+
+
+def test_stream_ticker_window_yields_correct_shape(tmp_path):
+    """Each window should have exactly window_size rows, and windows should be in time order."""
+    import pandas as pd
+    from ingestion.stream import stream_ticker_window
+
+    dates = pd.date_range("2021-01-01", periods=25, freq="B")
+    df = pd.DataFrame(
+        {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100, "ticker": "AAPL"},
+        index=dates,
+    )
+    df.index.name = "date"
+    df.to_parquet(tmp_path / "AAPL.parquet")
+
+    windows = list(stream_ticker_window("AAPL", window_size=5, delay_seconds=0, data_dir=tmp_path))
+    # 25 rows, window_size=5 → 21 windows
+    assert len(windows) == 21
+    for w in windows:
+        assert len(w) == 5
+    # Each window's last date should advance by one day
+    assert windows[1].index[-1] > windows[0].index[-1]
+```
+
+### 2.6 Verify
+
+```bash
+uv run pytest tests/test_ingestion.py -v
+```
+
+Expected: 7 tests pass. The streaming tests use `tmp_path` (pytest's built-in temp dir fixture) — no network calls, no dependency on `data/raw/`.
+
 ---
 
 ## Step 3: Label Definition
@@ -383,24 +582,104 @@ def drop_unlabeled(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["label"]).copy()
 ```
 
----
+### 3.3 Create `tests/test_labels.py`
 
-## Step 4: Baseline Features
+```python
+"""Tests for training/labels.py — focus on leakage correctness."""
+
+import pandas as pd
+import pytest
+
+from training.labels import add_labels, add_labels_all_tickers, drop_unlabeled
+
+
+def make_ticker_df(prices: list[float], ticker="AAPL") -> pd.DataFrame:
+    dates = pd.date_range("2020-01-01", periods=len(prices), freq="B")
+    return pd.DataFrame({"close": prices, "ticker": ticker}, index=dates)
+
+
+def test_label_is_1_when_future_price_higher():
+    # close goes: 100, 100, 100, 100, 100, 110
+    # label[0] = 1 because close[5] (110) > close[0] (100)
+    df = make_ticker_df([100, 100, 100, 100, 100, 110])
+    result = add_labels(df)
+    assert result["label"].iloc[0] == 1
+
+
+def test_label_is_0_when_future_price_lower():
+    df = make_ticker_df([100, 100, 100, 100, 100, 90])
+    result = add_labels(df)
+    assert result["label"].iloc[0] == 0
+
+
+def test_last_n_rows_have_nan_label():
+    """The last forward_days rows cannot have a label — there's no future data."""
+    df = make_ticker_df([100.0] * 20)
+    result = add_labels(df, forward_days=5)
+    # Last 5 rows should be NaN
+    assert result["label"].iloc[-5:].isna().all()
+    # Earlier rows should have labels
+    assert result["label"].iloc[:-5].notna().all()
+
+
+def test_labels_do_not_bleed_across_tickers():
+    """
+    Shift must be applied per ticker.
+    If we shifted across the whole DataFrame, the last row of ticker A
+    would pick up the first row of ticker B as its 'future' price.
+    """
+    # AAPL: prices go down (label should be 0 for first row)
+    # MSFT: prices go up (if bleed occurs, AAPL's last row would see MSFT's price)
+    aapl = make_ticker_df([100, 99, 98, 97, 96, 95], ticker="AAPL")
+    msft = make_ticker_df([50, 51, 52, 53, 54, 999], ticker="MSFT")
+    df = pd.concat([aapl, msft]).sort_values(["ticker", "close"])
+
+    result = add_labels_all_tickers(df)
+    aapl_result = result[result["ticker"] == "AAPL"]
+
+    # AAPL prices are always decreasing, so all valid labels should be 0
+    valid_aapl_labels = drop_unlabeled(aapl_result)["label"]
+    assert (valid_aapl_labels == 0).all(), "AAPL labels should all be 0 (prices falling)"
+
+
+def test_drop_unlabeled_removes_nan_rows():
+    df = make_ticker_df([100.0] * 20)
+    labeled = add_labels(df, forward_days=5)
+    cleaned = drop_unlabeled(labeled)
+    assert cleaned["label"].notna().all()
+    assert len(cleaned) == 15  # 20 - 5 = 15
+```
+
+### 3.4 Verify
+
+```bash
+uv run pytest tests/test_labels.py -v
+```
+
+Expected: 5 tests pass. Pay close attention to `test_labels_do_not_bleed_across_tickers` — if that fails, the groupby logic is wrong.
+
+## Step 4: Baseline Features (Raw OHLCV)
 
 ### Philosophy
 
-These are intentionally simple. The goal is a working end-to-end pipeline, not a good model. Complexity gets added in the feature store (Week 6).
+The Week 5 baseline trains on **raw OHLCV columns only** — no feature engineering. This is intentional:
+- It establishes a true performance floor to compare against
+- It keeps Week 5 scope focused on infrastructure, not ML
+- Engineered features (RSI, returns, volatility, etc.) belong in the Week 6 feature store
 
-### Features we'll compute
+The clean split is: Week 5 = raw baseline, Week 6 = feature-engineered model. Comparing AUC between the two is itself a deliverable.
 
-| Feature | Formula | Why no leakage |
-|---|---|---|
-| `return_1d` | `(close[t] / close[t-1]) - 1` | Only uses past data |
-| `return_5d` | `(close[t] / close[t-5]) - 1` | Only uses past data |
-| `return_20d` | `(close[t] / close[t-20]) - 1` | Only uses past data |
-| `vol_20d` | Rolling 20-day std of daily returns | Only uses past data |
-| `rsi_14` | 14-day RSI | Only uses past data |
-| `volume_ratio` | `volume[t] / rolling_mean_volume_20d` | Only uses past data |
+### Features: raw OHLCV columns
+
+| Column | What it is |
+|---|---|
+| `open` | Opening price |
+| `high` | Daily high |
+| `low` | Daily low |
+| `close` | Closing price |
+| `volume` | Share volume |
+
+No leakage risk here — these are all observed values at time T, with no rolling or forward-looking computation.
 
 ### 4.1 Create `features/__init__.py` (empty)
 
@@ -410,95 +689,102 @@ These are intentionally simple. The goal is a working end-to-end pipeline, not a
 """
 Baseline feature set for Week 5.
 
-All features are point-in-time safe: feature[t] uses only close/volume data
-from day t and earlier. No future data is used.
+Uses raw OHLCV columns only — no feature engineering.
 
-This module is intentionally simple. The Week 6 feature store will replace it
-with versioned, registered feature definitions.
+Rationale: establishing a raw baseline first gives a clean comparison point
+when Week 6 introduces engineered features (returns, RSI, volatility, etc.)
+via the feature store. If the engineered model doesn't beat this baseline,
+something is wrong with the feature definitions.
 """
 
 import pandas as pd
 
-
-def add_return(df: pd.DataFrame, window: int) -> pd.DataFrame:
-    df = df.copy()
-    df[f"return_{window}d"] = df["close"].pct_change(window)
-    return df
+FEATURE_COLUMNS = ["open", "high", "low", "close", "volume"]
 
 
-def add_volatility(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    df = df.copy()
-    daily_returns = df["close"].pct_change()
-    df[f"vol_{window}d"] = daily_returns.rolling(window).std()
-    return df
-
-
-def add_rsi(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
-    """Compute Relative Strength Index."""
-    df = df.copy()
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(window).mean()
-    loss = (-delta.clip(upper=0)).rolling(window).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    df[f"rsi_{window}"] = 100 - (100 / (1 + rs))
-    return df
-
-
-def add_volume_ratio(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    df = df.copy()
-    avg_volume = df["volume"].rolling(window).mean()
-    df["volume_ratio"] = df["volume"] / avg_volume
-    return df
-
-
-def compute_baseline_features(df: pd.DataFrame) -> pd.DataFrame:
+def get_baseline_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply all baseline features to a single-ticker DataFrame.
+    Return a copy of df containing only the baseline feature columns.
 
-    All rolling operations use only historical data (no center=True, no future).
-    Rows with insufficient history for rolling windows will have NaN — these are
-    dropped later before training.
+    No computation needed — these are raw observed values at time T.
+    No rolling windows, no leakage risk.
 
     Args:
-        df: Single-ticker DataFrame sorted by date ascending
+        df: DataFrame with OHLCV columns
 
     Returns:
-        DataFrame with feature columns added
+        DataFrame with only FEATURE_COLUMNS retained
     """
-    df = add_return(df, 1)
-    df = add_return(df, 5)
-    df = add_return(df, 20)
-    df = add_volatility(df, 20)
-    df = add_rsi(df, 14)
-    df = add_volume_ratio(df, 20)
-    return df
+    missing = set(FEATURE_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    return df[FEATURE_COLUMNS].copy()
+```
+
+### 4.3 Create `tests/test_features.py`
+
+```python
+"""Tests for features/baseline.py"""
+
+import pandas as pd
+import pytest
+
+from features.baseline import FEATURE_COLUMNS, get_baseline_features
 
 
-def compute_baseline_features_all_tickers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply baseline features per ticker (rolling windows must not bleed across tickers).
-    """
-    return (
-        df.groupby("ticker", group_keys=False)
-        .apply(compute_baseline_features)
+def make_df(n=10) -> pd.DataFrame:
+    dates = pd.date_range("2021-01-01", periods=n, freq="B")
+    return pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1_000_000,
+            "ticker": "AAPL",
+            "label": 1,
+        },
+        index=dates,
     )
 
 
-FEATURE_COLUMNS = [
-    "return_1d",
-    "return_5d",
-    "return_20d",
-    "vol_20d",
-    "rsi_14",
-    "volume_ratio",
-]
+def test_get_baseline_features_returns_correct_columns():
+    df = make_df()
+    result = get_baseline_features(df)
+    assert list(result.columns) == FEATURE_COLUMNS
+
+
+def test_get_baseline_features_drops_non_feature_columns():
+    df = make_df()
+    result = get_baseline_features(df)
+    assert "ticker" not in result.columns
+    assert "label" not in result.columns
+
+
+def test_get_baseline_features_raises_on_missing_column():
+    df = make_df().drop(columns=["volume"])
+    with pytest.raises(ValueError, match="Missing required columns"):
+        get_baseline_features(df)
+
+
+def test_get_baseline_features_does_not_modify_input():
+    df = make_df()
+    original_cols = list(df.columns)
+    get_baseline_features(df)
+    assert list(df.columns) == original_cols
 ```
+
+### 4.4 Verify
+
+```bash
+uv run pytest tests/test_features.py -v
+```
+
+Expected: 4 tests pass.
 
 ---
 
 ## Step 5: Training Pipeline
-
-### 5.1 Create `training/evaluation.py`
 
 ```python
 """
@@ -576,7 +862,7 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
 
-from features.baseline import FEATURE_COLUMNS, compute_baseline_features_all_tickers
+from features.baseline import FEATURE_COLUMNS, get_baseline_features
 from ingestion.fetch import TICKERS, load_all
 from ingestion.validate import validate_raw
 from training.evaluation import compute_metrics
@@ -590,7 +876,7 @@ TEST_SPLIT_DATE = "2023-01-01"  # everything before this is train, after is test
 
 def build_dataset() -> pd.DataFrame:
     """
-    Load raw data, add labels and features, drop rows with NaN.
+    Load raw data, add labels, select raw OHLCV features, drop rows with NaN.
 
     Returns:
         Clean DataFrame ready for train/test split
@@ -605,15 +891,16 @@ def build_dataset() -> pd.DataFrame:
     logger.info("Adding labels (5-day forward direction)")
     df = add_labels_all_tickers(df)
 
-    logger.info("Computing baseline features")
-    df = compute_baseline_features_all_tickers(df)
+    # Raw OHLCV baseline: no feature engineering, just select the columns
+    # Engineered features (RSI, returns, volatility) are added in Week 6
+    logger.info("Selecting raw OHLCV baseline features")
+    features_df = get_baseline_features(df)
+    df = df[["ticker", "label"]].join(features_df)
 
-    # Drop rows where label or any feature is NaN
-    # These arise from: rolling window warmup period + last N rows (no label)
+    # Drop rows with no valid label (last 5 rows per ticker)
     before = len(df)
     df = drop_unlabeled(df)
-    df = df.dropna(subset=FEATURE_COLUMNS)
-    logger.info("Dropped %d rows with NaN (rolling warmup + unlabeled tail)", before - len(df))
+    logger.info("Dropped %d rows with no label (unlabeled tail)", before - len(df))
 
     return df
 
@@ -667,6 +954,7 @@ def train(
 
 
 def run_pipeline() -> None:
+    mlflow.set_tracking_uri("file:./mlruns")  # explicit local file-based tracking
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
     with mlflow.start_run(run_name="baseline_xgboost"):
@@ -697,151 +985,9 @@ if __name__ == "__main__":
     run_pipeline()
 ```
 
----
+### 5.3 Verify: run the full pipeline
 
-## Step 6: Tests
-
-### 6.1 Create `tests/__init__.py` (empty)
-
-### 6.2 Create `tests/test_ingestion.py`
-
-```python
-"""Tests for ingestion/fetch.py and ingestion/validate.py"""
-
-import pandas as pd
-import pytest
-
-from ingestion.validate import validate_raw
-
-
-def make_valid_df(n=200) -> pd.DataFrame:
-    dates = pd.date_range("2020-01-01", periods=n, freq="B")
-    return pd.DataFrame(
-        {
-            "open": 100.0,
-            "high": 101.0,
-            "low": 99.0,
-            "close": 100.5,
-            "volume": 1_000_000,
-            "ticker": "AAPL",
-        },
-        index=dates,
-    )
-
-
-def test_validate_raw_passes_valid_data():
-    df = make_valid_df()
-    validate_raw(df, "AAPL")  # should not raise
-
-
-def test_validate_raw_fails_on_missing_column():
-    df = make_valid_df().drop(columns=["volume"])
-    with pytest.raises(ValueError, match="Missing columns"):
-        validate_raw(df, "AAPL")
-
-
-def test_validate_raw_fails_on_too_few_rows():
-    df = make_valid_df(n=50)
-    with pytest.raises(ValueError, match="Only 50 rows"):
-        validate_raw(df, "AAPL")
-
-
-def test_validate_raw_fails_on_null_values():
-    df = make_valid_df()
-    df.loc[df.index[5], "close"] = None
-    with pytest.raises(ValueError, match="Null values"):
-        validate_raw(df, "AAPL")
-
-
-def test_validate_raw_fails_on_non_positive_close():
-    df = make_valid_df()
-    df.loc[df.index[0], "close"] = -1.0
-    with pytest.raises(ValueError, match="Non-positive close"):
-        validate_raw(df, "AAPL")
-```
-
-### 6.3 Create `tests/test_labels.py`
-
-```python
-"""Tests for training/labels.py — focus on leakage correctness."""
-
-import pandas as pd
-import pytest
-
-from training.labels import add_labels, add_labels_all_tickers, drop_unlabeled
-
-
-def make_ticker_df(prices: list[float], ticker="AAPL") -> pd.DataFrame:
-    dates = pd.date_range("2020-01-01", periods=len(prices), freq="B")
-    return pd.DataFrame({"close": prices, "ticker": ticker}, index=dates)
-
-
-def test_label_is_1_when_future_price_higher():
-    # close goes: 100, 100, 100, 100, 100, 110
-    # label[0] = 1 because close[5] (110) > close[0] (100)
-    df = make_ticker_df([100, 100, 100, 100, 100, 110])
-    result = add_labels(df)
-    assert result["label"].iloc[0] == 1
-
-
-def test_label_is_0_when_future_price_lower():
-    df = make_ticker_df([100, 100, 100, 100, 100, 90])
-    result = add_labels(df)
-    assert result["label"].iloc[0] == 0
-
-
-def test_last_n_rows_have_nan_label():
-    """The last forward_days rows cannot have a label — there's no future data."""
-    df = make_ticker_df([100.0] * 20)
-    result = add_labels(df, forward_days=5)
-    # Last 5 rows should be NaN
-    assert result["label"].iloc[-5:].isna().all()
-    # Earlier rows should have labels
-    assert result["label"].iloc[:-5].notna().all()
-
-
-def test_labels_do_not_bleed_across_tickers():
-    """
-    Shift must be applied per ticker.
-    If we shifted across the whole DataFrame, the last row of ticker A
-    would pick up the first row of ticker B as its 'future' price.
-    """
-    # AAPL: prices go down (label should be 0 for first row)
-    # MSFT: prices go up (if bleed occurs, AAPL's last row would see MSFT's price)
-    aapl = make_ticker_df([100, 99, 98, 97, 96, 95], ticker="AAPL")
-    msft = make_ticker_df([50, 51, 52, 53, 54, 999], ticker="MSFT")
-    df = pd.concat([aapl, msft]).sort_values(["ticker", "close"])
-
-    result = add_labels_all_tickers(df)
-    aapl_result = result[result["ticker"] == "AAPL"]
-
-    # AAPL prices are always decreasing, so all valid labels should be 0
-    valid_aapl_labels = drop_unlabeled(aapl_result)["label"]
-    assert (valid_aapl_labels == 0).all(), "AAPL labels should all be 0 (prices falling)"
-
-
-def test_drop_unlabeled_removes_nan_rows():
-    df = make_ticker_df([100.0] * 20)
-    labeled = add_labels(df, forward_days=5)
-    cleaned = drop_unlabeled(labeled)
-    assert cleaned["label"].notna().all()
-    assert len(cleaned) == 15  # 20 - 5 = 15
-```
-
----
-
-## Step 7: Running Everything
-
-### 7.1 Run tests first
-
-```bash
-cd /Users/dingnie/Documents/git_repo/ml_platform
-uv run pytest tests/ -v
-```
-
-All tests should pass before you fetch real data.
-
-### 7.2 Fetch data
+First fetch the data (requires network — run once):
 
 ```bash
 uv run python -c "
@@ -852,9 +998,7 @@ fetch_all()
 "
 ```
 
-This writes 5 Parquet files to `data/raw/`. Expect ~1700 rows per ticker (2018–2024 trading days).
-
-### 7.3 Run training pipeline
+Then run the pipeline:
 
 ```bash
 uv run python -m training.pipeline
@@ -873,7 +1017,7 @@ Expected output:
 
 **Do not chase accuracy.** A baseline near 52% is correct. If you see 70%+ something is wrong (likely leakage).
 
-### 7.4 View MLflow UI
+### 5.4 View MLflow UI
 
 ```bash
 uv run mlflow ui --port 5000
@@ -884,7 +1028,22 @@ You should see one run logged under the `ml_platform_baseline` experiment with a
 
 ---
 
-## Step 8: Validation Checklist
+## Step 6: Run All Tests
+
+With all modules in place, run the full test suite:
+
+```bash
+uv run pytest tests/ -v
+```
+
+Expected: **16 tests pass** across the three test files:
+- `tests/test_ingestion.py` — 7 tests (5 validate + 2 streaming)
+- `tests/test_labels.py` — 5 tests
+- `tests/test_features.py` — 4 tests
+
+---
+
+## Step 7: Validation Checklist
 
 Before calling Week 5 done, verify each item:
 
