@@ -17,3 +17,6 @@ data/raw/
 data/processed/
 mlruns/
 .ruff_cache/
+
+# Claude
+.claude/
