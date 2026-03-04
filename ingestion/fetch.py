@@ -8,6 +8,7 @@ Design decisions:
 """
 
 import logging
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -46,19 +47,17 @@ def fetch_ticker(
     output_path = output_dir / f"{ticker}.parquet"
 
     logger.info("Fetching %s from %s to %s", ticker, start, end)
-    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+
+    raw = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
 
     if raw.empty:
         raise ValueError(f"No data returned for ticker {ticker!r} ({start} to {end})")
 
-    # Normalize column names to lowercase for consistency
-    df = raw.copy()
+    # Normalize: lowercase columns, drop yfinance-specific extras, strip timezone
+    df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.columns = [c.lower() for c in df.columns]
+    df.index = df.index.tz_localize(None)  # drop tz-awareness (e.g. UTC-05:00 → naive)
     df.index.name = "date"
-
-    # Ensure date index is timezone-naive (yfinance sometimes returns tz-aware)
-    if hasattr(df.index, "tz") and df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
 
     df["ticker"] = ticker
 
@@ -83,6 +82,8 @@ def fetch_all(
     for ticker in tickers:
         path = fetch_ticker(ticker, start=start, end=end, output_dir=output_dir)
         results[ticker] = path
+        if ticker != tickers[-1]:
+            time.sleep(2)  # brief pause between tickers to avoid rate limiting
     return results
 
 
