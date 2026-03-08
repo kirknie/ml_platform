@@ -20,7 +20,9 @@ import mlflow
 import pandas as pd
 import xgboost as xgb
 
-from features.baseline import FEATURE_COLUMNS, get_baseline_features
+from features.baseline import FEATURE_COLUMNS
+from features.definitions import ENGINEERED_V1
+from features.store import FeatureStore
 from ingestion.fetch import TICKERS, load_all
 from ingestion.validate import validate_raw
 from training.evaluation import compute_metrics
@@ -49,11 +51,11 @@ def build_dataset() -> pd.DataFrame:
     logger.info("Adding labels (5-day forward direction)")
     df = add_labels_all_tickers(df)
 
-    # Raw OHLCV baseline: no feature engineering, just select the columns
-    # Engineered features (RSI, returns, volatility) are added in Week 6
+    # Raw OHLCV baseline: no feature engineering, just select the columns.
+    # Select all needed columns from df directly — avoids any index join issues
+    # since features_df is derived from the same DataFrame.
     logger.info("Selecting raw OHLCV baseline features")
-    features_df = get_baseline_features(df)
-    df = df[["ticker", "label"]].join(features_df)
+    df = df[["ticker", "label"] + FEATURE_COLUMNS].copy()
 
     # Drop rows with no valid label (last 5 rows per ticker)
     before = len(df)
@@ -137,6 +139,82 @@ def run_pipeline() -> None:
             print(f"  {k}: {v:.4f}")
 
 
+def build_dataset_from_store(store: FeatureStore) -> pd.DataFrame:
+    """
+    Load labels from raw data and join with precomputed features from the store.
+
+    Labels are derived from raw close prices (same logic as Week 5).
+    Features come from the offline feature store (Week 6).
+    Joined on the date index — only dates present in both are kept (inner join).
+
+    Returns:
+        DataFrame with label + feature columns, NaN rows dropped, ready for split.
+    """
+    logger.info("Loading raw data for labels: %s", TICKERS)
+    raw_df = load_all(TICKERS)
+
+    logger.info("Adding labels (5-day forward direction)")
+    labeled_df = add_labels_all_tickers(raw_df)
+    labeled_df = drop_unlabeled(labeled_df)
+    labels = labeled_df[["ticker", "label"]].reset_index()  # columns: date, ticker, label
+
+    logger.info(
+        "Loading engineered features from store: %s v%d",
+        store.feature_set.name,
+        store.feature_set.version,
+    )
+    features_df = store.load_offline_all(TICKERS).reset_index()  # columns: date, features..., ticker
+
+    # Merge on (ticker, date) — joining on date alone causes a many-to-many
+    # cartesian join because the date index has one row per ticker per date.
+    df = labels.merge(features_df, on=["ticker", "date"], how="inner")
+    df = df.set_index("date").dropna()
+    logger.info("Dataset: %d rows, %d feature columns", len(df), len(features_df.columns) - 2)
+    return df
+
+
+def run_engineered_pipeline() -> None:
+    """
+    Train XGBoost on engineered features and log to MLflow.
+
+    Feature set name and version are logged as params so this run is
+    fully reproducible: you can always look up exactly which features
+    produced a given result.
+    """
+    store = FeatureStore(ENGINEERED_V1)
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+    with mlflow.start_run(run_name="engineered_xgboost"):
+        df = build_dataset_from_store(store)
+        train_df, test_df = time_split(df, TEST_SPLIT_DATE)
+
+        feature_cols = store.feature_set.feature_names
+        model, metrics, params = train(train_df, test_df, feature_cols=feature_cols)
+
+        mlflow.log_params(params)
+        mlflow.log_params({
+            "tickers": ",".join(TICKERS),
+            "test_split_date": TEST_SPLIT_DATE,
+            "feature_set": store.feature_set.name,
+            "feature_set_version": store.feature_set.version,
+            "feature_columns": ",".join(feature_cols),
+            "train_rows": len(train_df),
+            "test_rows": len(test_df),
+        })
+        mlflow.log_metrics(metrics)
+        mlflow.xgboost.log_model(model, artifact_path="model")
+
+        logger.info("Engineered metrics: %s", metrics)
+        print("\n=== Engineered Feature Results ===")
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.4f}")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    print("--- Baseline (raw OHLCV) ---")
     run_pipeline()
+    print("\n--- Engineered features ---")
+    run_engineered_pipeline()
