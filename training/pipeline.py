@@ -14,6 +14,7 @@ Run this script directly:
     python -m training.pipeline
 """
 
+import hashlib
 import logging
 
 import mlflow
@@ -139,6 +140,18 @@ def run_pipeline() -> None:
             print(f"  {k}: {v:.4f}")
 
 
+def _fingerprint(df: pd.DataFrame) -> str:
+    """
+    MD5 hash of a DataFrame's values for reproducibility auditing.
+
+    Two runs that produce the same fingerprint used identical training data.
+    Logged as a param so you can verify reproducibility from the MLflow UI.
+    """
+    return hashlib.md5(
+        pd.util.hash_pandas_object(df, index=True).values.tobytes()
+    ).hexdigest()
+
+
 def build_dataset_from_store(store: FeatureStore) -> pd.DataFrame:
     """
     Load labels from raw data and join with precomputed features from the store.
@@ -173,22 +186,31 @@ def build_dataset_from_store(store: FeatureStore) -> pd.DataFrame:
     return df
 
 
-def run_engineered_pipeline() -> None:
+def run_engineered_pipeline(
+    test_split_date: str = TEST_SPLIT_DATE,
+    run_date: str | None = None,
+) -> tuple[str, dict]:
     """
     Train XGBoost on engineered features and log to MLflow.
 
-    Feature set name and version are logged as params so this run is
-    fully reproducible: you can always look up exactly which features
-    produced a given result.
+    Args:
+        test_split_date: Train/test boundary date (YYYY-MM-DD). Everything before
+                         this date is train, on or after is test.
+        run_date: Logical run date for metadata (YYYY-MM-DD). Defaults to None
+                  (not logged). Pass explicitly for reproducible scheduled runs.
+
+    Returns:
+        (run_id, metrics) — the MLflow run ID and evaluation metrics dict.
+        run_id is used by ModelRegistry.register() to locate the model artifact.
     """
     store = FeatureStore(ENGINEERED_V1)
 
     mlflow.set_tracking_uri("file:./mlruns")
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name="engineered_xgboost"):
+    with mlflow.start_run(run_name="engineered_xgboost") as active_run:
         df = build_dataset_from_store(store)
-        train_df, test_df = time_split(df, TEST_SPLIT_DATE)
+        train_df, test_df = time_split(df, test_split_date)
 
         feature_cols = store.feature_set.feature_names
         model, metrics, params = train(train_df, test_df, feature_cols=feature_cols)
@@ -196,20 +218,23 @@ def run_engineered_pipeline() -> None:
         mlflow.log_params(params)
         mlflow.log_params({
             "tickers": ",".join(TICKERS),
-            "test_split_date": TEST_SPLIT_DATE,
+            "test_split_date": test_split_date,
             "feature_set": store.feature_set.name,
             "feature_set_version": store.feature_set.version,
             "feature_columns": ",".join(feature_cols),
             "train_rows": len(train_df),
             "test_rows": len(test_df),
+            "train_data_fingerprint": _fingerprint(train_df),
         })
+        if run_date is not None:
+            mlflow.log_param("run_date", run_date)
         mlflow.log_metrics(metrics)
         mlflow.xgboost.log_model(model, artifact_path="model")
 
-        logger.info("Engineered metrics: %s", metrics)
-        print("\n=== Engineered Feature Results ===")
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
+        run_id = active_run.info.run_id
+
+    logger.info("Engineered metrics: %s", metrics)
+    return run_id, metrics
 
 
 if __name__ == "__main__":
@@ -217,4 +242,7 @@ if __name__ == "__main__":
     print("--- Baseline (raw OHLCV) ---")
     run_pipeline()
     print("\n--- Engineered features ---")
-    run_engineered_pipeline()
+    run_id, metrics = run_engineered_pipeline()
+    print(f"\n  run_id: {run_id}")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
