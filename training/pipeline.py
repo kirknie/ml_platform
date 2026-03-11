@@ -22,7 +22,7 @@ import pandas as pd
 import xgboost as xgb
 
 from features.baseline import FEATURE_COLUMNS
-from features.definitions import ENGINEERED_V1
+from features.definitions import ENGINEERED_V2
 from features.store import FeatureStore
 from ingestion.fetch import TICKERS, load_all
 from ingestion.validate import validate_raw
@@ -203,7 +203,7 @@ def run_engineered_pipeline(
         (run_id, metrics) — the MLflow run ID and evaluation metrics dict.
         run_id is used by ModelRegistry.register() to locate the model artifact.
     """
-    store = FeatureStore(ENGINEERED_V1)
+    store = FeatureStore(ENGINEERED_V2)
 
     mlflow.set_tracking_uri("file:./mlruns")
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
@@ -213,6 +213,10 @@ def run_engineered_pipeline(
         train_df, test_df = time_split(df, test_split_date)
 
         feature_cols = store.feature_set.feature_names
+
+        # Save training distribution for drift detection at serving time
+        store.save_training_stats(train_df[feature_cols])
+
         model, metrics, params = train(train_df, test_df, feature_cols=feature_cols)
 
         mlflow.log_params(params)
@@ -225,6 +229,7 @@ def run_engineered_pipeline(
             "train_rows": len(train_df),
             "test_rows": len(test_df),
             "train_data_fingerprint": _fingerprint(train_df),
+            "training_stats_path": str(store.store_dir / "training_stats.json"),
         })
         if run_date is not None:
             mlflow.log_param("run_date", run_date)
