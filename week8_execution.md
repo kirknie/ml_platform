@@ -743,11 +743,15 @@ def _log_prediction(
         logger.warning("Failed to write prediction log: %s", exc)
 ```
 
-### 5.3 Add FastAPI as a dependency
+### 5.3 Add FastAPI, uvicorn, and httpx as dependencies
 
 ```bash
 uv add fastapi uvicorn
+uv add --dev httpx   # required by FastAPI's TestClient for serving tests
 ```
+
+Note: if `uv add` fails due to a corporate proxy, install manually outside the proxy
+network and re-run `uv sync` to update `uv.lock`.
 
 ### 5.4 Start the server and smoke-test
 
