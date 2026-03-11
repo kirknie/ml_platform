@@ -26,6 +26,7 @@ Design decisions:
   range overwrites, making the operation idempotent
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -210,3 +211,53 @@ class FeatureStore:
             paths[ticker] = path
 
         return paths
+
+    # ------------------------------------------------------------------
+    # Training stats (used by drift detection in serving layer)
+    # ------------------------------------------------------------------
+
+    def save_training_stats(self, train_df: pd.DataFrame) -> Path:
+        """
+        Compute and persist per-feature mean/std from the training set.
+
+        Called once after each successful training run. The serving layer
+        loads these stats to detect when inference-time features fall outside
+        the training distribution (drift detection).
+
+        Args:
+            train_df: The training DataFrame containing only feature columns
+                      (no label or ticker). Typically train_df[feature_cols].
+
+        Returns:
+            Path to the saved training_stats.json file
+        """
+        feature_cols = self.feature_set.feature_names
+        stats = {
+            col: {
+                "mean": float(train_df[col].mean()),
+                "std": float(train_df[col].std()),
+            }
+            for col in feature_cols
+            if col in train_df.columns
+        }
+        path = self.store_dir / "training_stats.json"
+        path.write_text(json.dumps(stats, indent=2))
+        logger.info("Saved training stats for %d features to %s", len(stats), path)
+        return path
+
+    def load_training_stats(self) -> dict:
+        """
+        Load saved training stats.
+
+        Returns:
+            Dict of {feature_name: {mean: float, std: float}}
+
+        Raises:
+            FileNotFoundError: If save_training_stats() has not been called yet
+        """
+        path = self.store_dir / "training_stats.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No training stats at {path}. Run the training pipeline first."
+            )
+        return json.loads(path.read_text())
