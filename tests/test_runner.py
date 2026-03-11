@@ -93,3 +93,13 @@ def test_dry_run_skips_registry_writes():
     assert promoted is True  # would have promoted
     registry.register.assert_not_called()
     registry.promote.assert_not_called()
+
+
+def test_compute_split_date_is_deterministic():
+    """
+    Reproducibility: the same run_date always produces the same split_date.
+    This is the foundation of reproducible scheduled runs.
+    """
+    run_date = date(2024, 9, 15)
+    assert compute_split_date(run_date) == compute_split_date(run_date)
+    assert compute_split_date(run_date) == compute_split_date(run_date, EVALUATION_WINDOW_DAYS)

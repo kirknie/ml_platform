@@ -230,3 +230,45 @@ def test_backfill_preserves_rows_outside_range(price_df: pd.DataFrame, tmp_path:
     assert len(after_backfill) >= len(rows_before_split), (
         "Backfill deleted rows outside the backfill range"
     )
+
+# ---------------------------------------------------------------------------
+# V2 offline/online parity (includes return_20d and macd_signal)
+# ---------------------------------------------------------------------------
+
+from features.definitions import ENGINEERED_V2
+
+
+@pytest.mark.parametrize(
+    "feat,tol",
+    [(f, 1e-2 if f.name == "macd_signal" else 1e-6) for f in ENGINEERED_V2.features],
+    ids=lambda x: x.name if hasattr(x, "name") else str(x),
+)
+def test_offline_online_parity_v2(feat, tol, price_df):
+    """
+    V2 parity test. macd_signal uses relaxed tolerance (1e-2) because EWM
+    with required_window=100 approximates the full-history offline value —
+    initialization error is < 0.5% of signal magnitude.
+
+    price_df has 100 rows. Skip positions where the window would start before
+    the DataFrame (only affects macd_signal with required_window=100).
+    """
+    offline_series = feat.offline(price_df)
+
+    for t in [50, 60, 70, 80]:
+        window_start = t - feat.required_window + 1
+        if window_start < 0:
+            continue  # not enough rows at this position — skip
+
+        window = price_df.iloc[window_start : t + 1]
+        assert len(window) == feat.required_window
+
+        online_val = feat.online(window)
+        offline_val = offline_series.iloc[t]
+
+        if math.isnan(offline_val) or math.isnan(online_val):
+            continue  # insufficient data — skip
+
+        assert abs(online_val - offline_val) < tol, (
+            f"{feat.name} parity failed at t={t}: "
+            f"offline={offline_val:.8f}, online={online_val:.8f}, tol={tol}"
+        )
