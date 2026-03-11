@@ -171,6 +171,7 @@ def predict(req: PredictRequest):
             )
 
         window = raw_df.tail(_store.feature_set.max_required_window)
+        prediction_date = str(window.index[-1].date())
         features = _store.compute_online(window)
 
         X = pd.DataFrame([features])[_store.feature_set.feature_names]
@@ -194,6 +195,7 @@ def predict(req: PredictRequest):
         direction=direction,
         probability=probability,
         model_version=_state.model_version,
+        prediction_date=prediction_date,
     )
 
     return PredictResponse(
@@ -242,12 +244,14 @@ def _log_prediction(
     direction: str,
     probability: float,
     model_version: str | None,
+    prediction_date: str | None = None,
 ) -> None:
     """Append one prediction to the JSONL log. Best-effort — never raises."""
     PREDICTIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "ticker": ticker,
+        "prediction_date": prediction_date,
         "direction": direction,
         "probability": probability,
         "model_version": model_version,
